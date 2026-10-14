@@ -1,0 +1,136 @@
+// PostgreSQL integration tests. Run with LPGRAPP_TEST_PGLITE pointing to a local
+// @electric-sql/pglite module and LPGRAPP_TEST_DATA to the private fixtures folder.
+import {readFile,readdir} from 'node:fs/promises';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+const {PGlite}=await import(process.env.LPGRAPP_TEST_PGLITE);
+const db=new PGlite();
+const testRoot=process.env.LPGRAPP_TEST_DATA;
+const fixtures=JSON.parse(await readFile(path.join(testRoot,'base.json'),'utf8'));
+const payload=JSON.parse(await readFile(path.join(testRoot,'reprise-excel-privee.json'),'utf8'));
+let checks=0;
+const check=(v,msg)=>{assert.ok(v,msg);checks++;};
+const scalar=async(sql,p=[])=>Object.values((await db.query(sql,p)).rows[0])[0];
+async function rejects(sql,p,msg){await assert.rejects(db.query(sql,p),msg);checks++;}
+try {
+ await db.exec(`CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role BYPASSRLS;
+ CREATE SCHEMA auth; CREATE TABLE auth.users(id uuid PRIMARY KEY, raw_user_meta_data jsonb DEFAULT '{}',email text);
+ CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$;
+ CREATE FUNCTION auth.role() RETURNS text LANGUAGE sql STABLE AS $$ SELECT nullif(current_setting('request.jwt.claim.role',true),'') $$;
+ GRANT USAGE ON SCHEMA auth TO anon,authenticated,service_role;
+ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA auth TO anon,authenticated,service_role;`);
+ for(const name of (await readdir('supabase/migrations')).filter(x=>x.endsWith('.sql')).sort()){
+  if(name.includes('006')||name.includes('007')||name.includes('008'))break;
+  let sql=await readFile('supabase/migrations/'+name,'utf8');sql=sql.replace(/create extension if not exists pgcrypto;/i,'');
+  await db.exec('SET check_function_bodies=off');
+  await db.exec(sql);
+  await db.exec('SET check_function_bodies=on');
+ }
+ for(const p of fixtures.profiles)await db.query(`INSERT INTO auth.users(id,email) VALUES($1,'test@example.invalid')`,[p.id]);
+ await db.exec('TRUNCATE public.locations CASCADE');
+ for(const table of ['books','contacts','locations','events','expenses','crm_actions','legacy_import_rows']){
+  for(const row of fixtures[table])await db.query(`INSERT INTO public.${table} SELECT (jsonb_populate_record(null::public.${table},$1::jsonb)).*`,[JSON.stringify(row)]);
+ }
+ const auditBaseline=await scalar('select coalesce(max(id),0) from public.audit_logs');
+ for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
+ check(await scalar('select count(*) from public.app_members')===fixtures.profiles.length,'Existing users bootstrapped');
+ const imported=await db.query('select public.import_workbook_snapshot($1::jsonb) result',[JSON.stringify(payload)]);
+ check(imported.rows[0].result.status==='imported','Snapshot imported');
+ check(await scalar('select count(*) from public.historical_orders')===59,'59 orders');
+ check(await scalar('select count(*) from public.historical_order_lines')===254,'254 lines');
+ check(Number(await scalar('select sum(source_received) from public.historical_orders'))===3361.1,'Source money exact');
+ check(await scalar('select count(*) from public.legacy_import_rows')===(fixtures.legacy_import_rows?.length??0)+1311,'Every new source row preserved alongside the older staging');
+ check(await scalar('select count(*) from public.stock_movements')===0,'History does not affect stock');
+ check(await scalar('select count(*) from public.sales')===0,'No invented operational sales');
+ check(await scalar('select count(*) from public.workbook_reconciliation')===1,'Expense difference held for review');
+ check(await scalar('select count(*) from public.contacts')>fixtures.contacts.length,'New historical contacts recovered');
+ check(await scalar(`select count(*) from public.workbook_stock_observations where physical_quantity is not null`)===10,'Ten known physical counts');
+ check(await scalar(`select physical_quantity from public.workbook_stock_observations o join public.books b on b.id=o.book_id where b.tome_number=10`)===null,'Unknown physical quantity stays null');
+ const again=(await db.query('select public.import_workbook_snapshot($1::jsonb) result',[JSON.stringify(payload)])).rows[0].result;
+ check(again.status==='already_imported','Import replay idempotent');
+ check(await scalar('select count(*) from public.historical_order_lines')===254,'Replay does not duplicate');
+ const invalid={...payload,sha256:'a'.repeat(64),summary:{...payload.summary,order_count:999}};
+ await rejects('select public.import_workbook_snapshot($1::jsonb)',[JSON.stringify(invalid)],'Import control mismatch aborts atomically');
+ check(await scalar('select count(*) from public.workbook_imports')===1,'Failed import leaves no partial batch');
+ check(await scalar('select count(*) from public.historical_order_lines')===254,'Failed import leaves no partial lines');
+
+ const actor=fixtures.profiles[0].id;
+ await db.query(`select set_config('request.jwt.claim.sub',$1,false)`,[actor]);
+ await db.exec('SET ROLE authenticated');
+ check((await db.query('select public.workbook_summary() data')).rows[0].data.orders===59,'Member summary');
+ await rejects('select public.import_workbook_snapshot($1::jsonb)',[JSON.stringify(payload)],'Browser import forbidden');
+ const order=(await db.query(`select o.* from public.historical_orders o where (select count(*) from public.historical_order_lines l where l.order_id=o.id and l.book_id is not null)=1 and (select count(*) from public.historical_order_lines l where l.order_id=o.id)=1 limit 1`)).rows[0];
+ const lines=(await db.query('select * from public.historical_order_lines where order_id=$1',[order.id])).rows;
+ const reviewLines=lines.map(l=>({id:l.id,quantity:1,delivered:null}));
+ await db.query(`select public.review_historical_order($1,'accepted','sale',$2,null,15,15,'Rapproché avec le justificatif de test',$3::jsonb)`,[order.id,order.contact_id,JSON.stringify(reviewLines)]);
+ check(await scalar('select review_status from public.historical_orders where id=$1',[order.id])==='accepted','Review applied');
+ check(await scalar('select count(*) from public.stock_movements')===0,'Review does not change stock');
+ await db.exec('RESET ROLE');
+ await db.query('select public.import_workbook_snapshot($1::jsonb)',[JSON.stringify(payload)]);
+ check(await scalar('select review_status from public.historical_orders where id=$1',[order.id])==='accepted','Replay preserves reviews');
+ await db.exec('SET ROLE authenticated');
+ const inv=await scalar(`select public.prepare_workbook_inventory((select id from public.workbook_imports where is_current),current_date,'Stock principal uniquement, comptage confirmé pour le test')`);
+ check(await scalar(`select count(*) from public.inventory_lines where inventory_session_id=$1 and counted_quantity is not null`,[inv])===10,'Inventory draft prefilled');
+ check(await scalar('select count(*) from public.stock_movements')===0,'Preparation is not validation');
+ await rejects('select public.validate_inventory($1)',[inv],'Missing counts block inventory');
+ const counts=(await db.query('select book_id,counted_quantity from public.inventory_lines where inventory_session_id=$1',[inv])).rows.map(l=>({book_id:l.book_id,counted_quantity:l.counted_quantity??0}));
+ await db.query('select public.save_inventory_counts($1,$2::jsonb)',[inv,JSON.stringify(counts)]);
+ await db.query('select public.validate_inventory($1)',[inv]);
+ check(Number(await scalar('select sum(quantity_delta) from public.stock_movements'))===420,'Validated inventory stock exact');
+ await rejects('select public.save_inventory_counts($1,$2::jsonb)',[inv,JSON.stringify(counts)],'Validated inventory immutable');
+ const book=await scalar('select id from public.books where tome_number=1');
+ const contact=order.contact_id;
+ const dep=await scalar(`select public.create_consignment($1,current_date,30,'test',$2::jsonb)`,[contact,JSON.stringify([{book_id:book,quantity:2,unit_price:9}])]);
+ await db.query('select public.return_consignment_stock($1,$2::jsonb,false,current_date,null)',[dep,JSON.stringify([{book_id:book,quantity:1}])]);
+ check(Number(await scalar(`select warehouse_stock from public.v_book_stock where book_id=$1`,[book]))===25,'Consignment partial return repaired');
+ await db.query('select public.return_consignment_stock($1,$2::jsonb,true,current_date,null)',[dep,JSON.stringify([{book_id:book,quantity:1}])]);
+ check(await scalar('select status from public.consignments where id=$1',[dep])==='closed','Full return closes consignment');
+ const item=JSON.stringify([{book_id:book,quantity:1,unit_price:9}]);
+ for(let i=0;i<7;i++)await db.query(`select public.create_sale(current_date,$1,'test','autre',9,0,null,$2::jsonb)`,[contact,item]);
+ check(Number((await db.query('select public.dashboard_totals() data')).rows[0].data.sales_total)===63,'Dashboard includes more than six sales');
+ const request='22222222-2222-4222-8222-222222222222';
+ const one={p_sale_date:'2026-10-14',p_contact_id:contact,p_channel:'test',p_payment_method:'autre',p_payment_amount:0,p_shipping_charged:0,p_note:null,p_items:[{book_id:book,quantity:1,unit_price:9}]};
+ const created=await scalar('select public.create_sale_once($1,$2::jsonb)',[request,JSON.stringify(one)]);
+ const repeated=await scalar('select public.create_sale_once($1,$2::jsonb)',[request,JSON.stringify(one)]);
+ check(created===repeated,'Sale retries return original identity');
+ check(await scalar('select count(*) from public.sales')===8,'Sale retry created no duplicate');
+ await rejects('select public.create_sale_once($1,$2::jsonb)',[request,JSON.stringify({...one,p_shipping_charged:2})],'Changed request content rejected');
+ const payment={p_sale_id:created,p_payment_date:'2026-10-14',p_amount:9,p_payment_method:'autre',p_reference:null,p_note:null};
+ const paid=await scalar('select public.record_sale_payment_once($1,$2::jsonb)',[request,JSON.stringify(payment)]);
+ check(paid===await scalar('select public.record_sale_payment_once($1,$2::jsonb)',[request,JSON.stringify(payment)]),'Payment retries return same identity');
+ await rejects('select public.record_sale_payment_once($1,$2::jsonb)',['33333333-3333-4333-8333-333333333333',JSON.stringify({...payment,p_amount:1})],'Overpayment rejected');
+ const imp=await scalar('select id from public.workbook_imports where is_current');
+ const search=(await db.query('select * from public.search_workbook_rows($1,$2,$3,true,0,40)',[imp,'04 VENTES','HIST-059'])).rows;
+ check(search.length>0,'Search finds late rows independently of current page');
+ const diff=await scalar('select id from public.workbook_reconciliation');
+ await db.query('select public.resolve_workbook_difference($1,true,$2)',[diff,'Justificatif rapproché pendant le test']);
+ check(Number(await scalar("select amount from public.expenses where source_legacy='excel:06 DEPENSES:D012'"))===2822,'Expense changed only by explicit review');
+
+ await db.exec('RESET ROLE');
+ const nonmember='11111111-1111-4111-8111-111111111111';
+ await db.query(`insert into auth.users(id,email) values($1,'other@example.invalid')`,[nonmember]);
+ await db.query(`select set_config('request.jwt.claim.sub',$1,false)`,[nonmember]);
+ await db.exec('SET ROLE authenticated');
+ check(await scalar('select count(*) from public.contacts')===0,'Nonmember cannot read contacts');
+ await rejects(`select public.create_sale(current_date,null,'test','autre',9,0,null,$1::jsonb)`,[item],'Nonmember RPC blocked');
+ await db.exec('RESET ROLE');
+ await db.exec(await readFile('supabase/migrations/202610140006_members_and_fixes.sql','utf8'));
+ check(await scalar('select count(*) from public.app_members where user_id=$1',[nonmember])===0,'Reapplying migration does not authorize new users');
+ await db.query(`select set_config('request.jwt.claim.sub','',false)`);
+ await db.exec('SET ROLE anon');
+ await rejects('select * from public.historical_orders',[],'Anonymous history forbidden');
+ await rejects(`truncate public.audit_logs`,[],'Anonymous truncate forbidden');
+ await db.exec('RESET ROLE');
+ check(!await scalar(`select exists(select 1 from public.audit_logs where id>$1 and (new_data ? 'name' or new_data ? 'email' or new_data ? 'customer_name'))`,[auditBaseline]),'No new personal snapshots in audit');
+ await db.query(`select set_config('request.jwt.claim.sub',$1,false)`,[actor]);
+ await db.exec('SET ROLE authenticated');
+ await rejects("update public.contacts set marketing_status='opted_in' where id=$1",[contact],'Undocumented marketing consent blocked');
+ await db.query("update public.contacts set marketing_status='opted_out' where id=$1",[contact]);
+ check(await scalar('select marketing_opt_out_at is not null from public.contacts where id=$1',[contact]),'Opposition timestamp recorded');
+ await db.exec('RESET ROLE');
+
+ for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
+ check(await scalar('select count(*) from public.historical_order_lines')===254,'Migrations safely reapplied after data and reviews');
+ check(await scalar('select count(*) from public.app_members where user_id=$1',[nonmember])===0,'Full reapplication preserves membership restrictions');
+ console.log(`${checks} PostgreSQL integration checks passed. No remote database used.`);
+} catch(e) {console.error(JSON.stringify({message:e.message,detail:e.detail,where:e.where,code:e.code}));process.exitCode=1;} finally {await db.close();}

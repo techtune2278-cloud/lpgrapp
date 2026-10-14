@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+
+migration/private-*
+**/private-workbook-*
+**/private-seed-*
+**/reprise-excel-privee.json
+**/02_IMPORT_PRIVE_SUPABASE.sql
+**/PRIVE_NE_PAS_PUBLIER/**
+private_delivery/
+
+*.xlsx
+*.xls
+*.csv
+*.zip
