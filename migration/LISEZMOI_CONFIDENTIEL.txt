@@ -1,0 +1,11 @@
+LPGR'APP — données privées pour initialiser la base
+
+Ce dossier contient des noms, coordonnées, historique de prospection et des données commerciales.
+Les trois fichiers de ce dossier sont exclus du dépôt avec le motif migration/private-* du .gitignore. Ne supprimez pas ce motif.
+
+Ordre :
+1. Après les migrations 001–004 et supabase/seed_catalog.sql, exécutez migration/private-seed-reference-data.sql dans Supabase SQL Editor.
+2. Le fichier migration/private-workbook-extract.json est déjà au bon endroit pour l'import de staging si l'archive est extraite à la racine du projet.
+3. Utilisez .env.migration (clé service_role uniquement sur votre poste local) puis npm run import:legacy pour déposer toutes les feuilles en staging.
+
+Les ventes historiques, paiements et stocks ne sont pas transformés automatiquement, pour éviter les écritures inexactes. La source complète est conservée pour rapprochement dans l'écran Reprise Excel.
