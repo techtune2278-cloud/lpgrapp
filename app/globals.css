@@ -11,3 +11,7 @@
 /* Suivi des soldes et opérations V0.5. */
 .list-row{display:flex;align-items:center;gap:12px;padding:14px 0;border-bottom:1px solid var(--line);flex-wrap:wrap}.list-row-main{flex:1;min-width:180px}.list-row-main strong,.list-row-main span{display:block}.list-row-main span{font-size:12px;color:var(--muted);margin-top:5px}.workbook-modal form>label,.workbook-modal>label{margin:12px 0}.workbook-section details .form-grid{margin:14px 0}
 @media(max-width:760px){.table-actions{flex-wrap:wrap;white-space:normal}.list-row>.btn{width:100%}.workbook-metrics{padding:15px;gap:12px}}
+
+/* Dépenses par payeur et navigation stock V0.5.1. */
+.payer-row{margin:14px 0 20px}.payer-label{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:7px;font-size:12px}.payer-track{height:14px;background:#eaf0e9;border-radius:7px;overflow:hidden}.payer-bar{height:100%;background:var(--forest);border-radius:7px}.stock-navigation{margin-bottom:20px}.stock-navigation .btn{white-space:normal}
+@media(max-width:760px){.stock-navigation{display:grid;grid-template-columns:1fr}.payer-label span{width:100%}}

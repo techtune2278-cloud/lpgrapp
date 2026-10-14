@@ -33,7 +33,7 @@ try {
   for(const row of fixtures[table])await db.query(`INSERT INTO public.${table} SELECT (jsonb_populate_record(null::public.${table},$1::jsonb)).*`,[JSON.stringify(row)]);
  }
  const auditBaseline=await scalar('select coalesce(max(id),0) from public.audit_logs');
- for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_|001[0-6]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
+ for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_|001[0-7]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
  check(await scalar('select count(*) from public.app_members')===fixtures.profiles.length,'Existing users bootstrapped');
  const imported=await db.query('select public.import_workbook_snapshot($1::jsonb) result',[JSON.stringify(payload)]);
  check(imported.rows[0].result.status==='imported','Snapshot imported');
@@ -246,6 +246,27 @@ try {
  await rejects('select public.save_collection_settings(1,1,1,1)',[],'Ordinary user cannot change settings');
  await rejects("select public.save_shipping_rate('France',1,1,true)",[],'Ordinary user cannot change postal rates');
  await rejects(`insert into public.sale_refunds(sale_id,refund_date,amount,payment_method,note,created_by) values($1,current_date,1,'autre','bypass',$2)`,[created,actor],'Direct refund writes denied');
+ // V0.5.1: finance totals are server aggregates, not truncated registry rows.
+ const financeBefore=await scalar('select public.expense_payment_summary()');
+ check(Number(financeBefore.paid)===Number(await scalar("select coalesce(sum(amount),0) from public.expenses where status='paid'")),'Expense KPI matches every paid expense');
+ await db.query(`insert into public.expenses(expense_date,category,amount,paid_by,status,created_by) select current_date,'Autre',1,'Test payeur', 'paid',$1 from generate_series(1,1005)`,[actor]);
+ await db.query(`insert into public.expenses(expense_date,category,amount,paid_by,status,created_by) values(current_date,'Autre',7,'Test payeur','to_pay',$1),(current_date,'Autre',50,'Test payeur','cancelled',$1),(current_date,'Autre',3,null,'paid',$1)`,[actor]);
+ const financeAfter=await scalar('select public.expense_payment_summary()');
+ check(Number(financeAfter.paid)===Number(financeBefore.paid)+1008,'Expense KPI includes paid rows beyond 1000');
+ check(Number(financeAfter.to_pay)===Number(financeBefore.to_pay)+7,'Expense KPI separates unpaid costs');
+ check(Number(financeAfter.recorded)===Number(financeBefore.recorded)+1015,'Expense KPI excludes cancelled costs');
+ check(Number(financeAfter.by_payer.find(p=>p.payer==='Test payeur').amount)===1005,'Payer chart excludes pending and cancelled costs');
+ check(financeAfter.by_payer.some(p=>p.payer==='Non renseigné'&&Number(p.amount)>=3),'Missing payer remains visible');
+ // Reminders use explicit dated statuses; completing an action removes its alert.
+ const dueBefore=await scalar("select public.commercial_reminders('2026-11-30')");
+ const reminderId=randomUUID();
+ await db.query(`insert into public.crm_actions(id,contact_id,action_date,summary,next_action,due_date,status,created_by) values($1,$2,current_date,'Appel de test','Relancer fin novembre','2026-11-30','planned',$3)`,[reminderId,contact,actor]);
+ const dueAfter=await scalar("select public.commercial_reminders('2026-11-30')");
+ check(Number(dueAfter.today)===Number(dueBefore.today)+1,'Dated commercial action counted on its due date');
+ const late=await scalar("select public.commercial_reminders('2026-12-01')");
+ check(Number(late.overdue)===Number(await scalar("select count(*) from public.crm_actions where status in('planned','waiting') and due_date<'2026-12-01'")),'Unfinished reminders become overdue');
+ await db.query("update public.crm_actions set status='done' where id=$1",[reminderId]);
+ check(Number((await scalar("select public.commercial_reminders('2026-11-30')")).today)===Number(dueBefore.today),'Completing a reminder removes its alert');
  await db.exec('RESET ROLE');
  const nonmember='11111111-1111-4111-8111-111111111111';
  await db.query(`insert into auth.users(id,email) values($1,'other@example.invalid')`,[nonmember]);
@@ -254,6 +275,8 @@ try {
  check(await scalar('select count(*) from public.contacts')===0,'Nonmember cannot read contacts');
  check(await scalar('select count(*) from public.sale_refunds')===0,'Nonmember cannot read refunds');
  await rejects('select public.search_sales_financials()',[],'Nonmember cannot search sales');
+ await rejects('select public.expense_payment_summary()',[],'Nonmember cannot read payment summaries');
+ await rejects('select public.commercial_reminders()',[],'Nonmember cannot read reminders');
  await rejects('select public.open_historical_commitment_once($1,$2::jsonb)',[randomUUID(),JSON.stringify(openPayload)],'Nonmember cannot open a historical commitment');
  await rejects(`select public.create_sale(current_date,null,'test','autre',9,0,null,$1::jsonb)`,[item],'Nonmember RPC blocked');
  await db.exec('RESET ROLE');
@@ -272,7 +295,7 @@ try {
  check(await scalar('select marketing_opt_out_at is not null from public.contacts where id=$1',[contact]),'Opposition timestamp recorded');
  await db.exec('RESET ROLE');
 
- for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_|001[0-6]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
+ for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_|001[0-7]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
  check(await scalar('select count(*) from public.historical_order_lines')===254,'Migrations safely reapplied after data and reviews');
  check(await scalar('select count(*) from public.app_members where user_id=$1',[nonmember])===0,'Full reapplication preserves membership restrictions');
  if(process.env.LPGRAPP_TEST_RELEASE_SQL){
@@ -283,6 +306,18 @@ try {
   await db.exec('SET ROLE authenticated');
   check(Number((await totals()).received_total)>0,'Combined SQL installer preserves access to cumulative totals');
   await db.exec('RESET ROLE');
+ }
+ if(process.env.LPGRAPP_TEST_MEMBER_SQL){
+  const memberSql=await readFile(process.env.LPGRAPP_TEST_MEMBER_SQL,'utf8');
+  const targetEmail=memberSql.match(/lower\('([^']+)'\)/)[1];
+  await assert.rejects(db.exec(memberSql));checks++;
+  await db.exec('ROLLBACK');
+  const newMemberId=randomUUID(),priorAdmin=await scalar('select can_admin from public.app_members where user_id=$1',[actor]);
+  await db.query('insert into auth.users(id,email) values($1,$2)',[newMemberId,targetEmail]);
+  await db.exec(memberSql);
+  const membership=(await db.query('select is_active,can_admin from public.app_members where user_id=$1',[newMemberId])).rows[0];
+  check(membership.is_active===true&&membership.can_admin===false,'Provided second account receives normal membership only');
+  check(await scalar('select can_admin from public.app_members where user_id=$1',[actor])===priorAdmin,'Account provisioning preserves existing admin flag');
  }
  console.log(`${checks} PostgreSQL integration checks passed. No remote database used.`);
 } catch(e) {console.error(JSON.stringify({message:e.message,detail:e.detail,where:e.where,code:e.code}));process.exitCode=1;} finally {await db.close();}
