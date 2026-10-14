@@ -33,7 +33,7 @@ try {
   for(const row of fixtures[table])await db.query(`INSERT INTO public.${table} SELECT (jsonb_populate_record(null::public.${table},$1::jsonb)).*`,[JSON.stringify(row)]);
  }
  const auditBaseline=await scalar('select coalesce(max(id),0) from public.audit_logs');
- for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_|001[0-7]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
+ for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_|001[0-8]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
  check(await scalar('select count(*) from public.app_members')===fixtures.profiles.length,'Existing users bootstrapped');
  const imported=await db.query('select public.import_workbook_snapshot($1::jsonb) result',[JSON.stringify(payload)]);
  check(imported.rows[0].result.status==='imported','Snapshot imported');
@@ -267,6 +267,45 @@ try {
  check(Number(late.overdue)===Number(await scalar("select count(*) from public.crm_actions where status in('planned','waiting') and due_date<'2026-12-01'")),'Unfinished reminders become overdue');
  await db.query("update public.crm_actions set status='done' where id=$1",[reminderId]);
  check(Number((await scalar("select public.commercial_reminders('2026-11-30')")).today)===Number(dueBefore.today),'Completing a reminder removes its alert');
+ // V0.5.2: reminders are opt-in, dated, counted without identifying payloads.
+ check(Number(await scalar('select count(*) from public.crm_actions where ntfy_enabled'))===0,'Imported actions remain opted out of ntfy');
+ await rejects('update public.contacts set ntfy_enabled=true,follow_up_on=null where id=$1',[contact],'Contact push requires a date');
+ const noDateAction=await scalar('select id from public.crm_actions limit 1');
+ if(noDateAction)await rejects('update public.crm_actions set ntfy_enabled=true,due_date=null where id=$1',[noDateAction],'Action push requires a date');
+ const notifyContact=randomUUID(),inactiveContact=randomUUID();
+ await db.query(`insert into public.contacts(id,name,contact_type,is_active,follow_up_on,follow_up_reason,ntfy_enabled,created_by) values($1,'Contact test notification','autre',true,'2026-10-13','Objet qui ne doit pas sortir',true,$3),($2,'Contact inactif notification','autre',false,'2026-10-13','Privé',true,$3)`,[notifyContact,inactiveContact,actor]);
+ const notifyAction=randomUUID();
+ await db.query(`insert into public.crm_actions(id,contact_id,summary,due_date,status,ntfy_enabled,created_by) values($1,$2,'Texte privé ancien','2026-10-13','planned',true,$3)`,[notifyAction,notifyContact,actor]);
+ await db.query(`insert into public.crm_actions(contact_id,summary,due_date,status,ntfy_enabled,created_by) values($1,'Texte privé du jour','2026-10-14','waiting',true,$2),($1,'Texte privé futur','2026-10-15','planned',true,$2),($1,'Texte privé terminé','2026-10-13','done',true,$2)`,[notifyContact,actor]);
+ await db.query(`insert into public.crm_actions(contact_id,summary,due_date,status,ntfy_enabled,created_by) values($1,'Action sur contact inactif','2026-10-13','planned',true,$2)`,[inactiveContact,actor]);
+ await rejects("select public.ntfy_digest('2026-10-14')",[],'Normal members cannot call the server digest');
+ await rejects("select public.claim_notification_run('daily:2026-10-14',2,1)",[],'Members cannot reserve notification jobs');
+ await db.exec('RESET ROLE; SET ROLE service_role');
+ const ntfyDigest=await scalar("select public.ntfy_digest('2026-10-14')");
+ check(ntfyDigest.actions===2&&ntfyDigest.contacts===1,'Digest includes due opted-in actions and active contacts only');
+ check(ntfyDigest.overdue_actions===1&&ntfyDigest.overdue_contacts===1,'Digest separates overdue counts');
+ check(Object.keys(ntfyDigest).sort().join(',')==='actions,contacts,overdue_actions,overdue_contacts','Server notification payload contains no names, notes or IDs');
+ const claim=await scalar("select public.claim_notification_run('daily:2026-10-14',2,1)");
+ check(claim.claimed===true,'Server can reserve a daily notification');
+ check((await scalar("select public.claim_notification_run('daily:2026-10-14',2,1)")).claimed===false,'An active slot cannot be claimed again');
+ check(await scalar("select public.finish_notification_run($1,$2,'sent',null)",[claim.id,randomUUID()])===false,'Foreign lease cannot acknowledge a notification');
+ check(await scalar("select public.finish_notification_run($1,$2,'failed','provider_rejected')",[claim.id,claim.lease])===true,'Known rejection is recorded');
+ const retryClaim=await scalar("select public.claim_notification_run('daily:2026-10-14',2,1)");
+ check(retryClaim.claimed&&retryClaim.lease!==claim.lease,'Known rejection allows a new lease');
+ check(await scalar("select public.finish_notification_run($1,$2,'sent',null)",[claim.id,claim.lease])===false,'Old lease cannot finish a retried notification');
+ await scalar("select public.finish_notification_run($1,$2,'sent',null)",[retryClaim.id,retryClaim.lease]);
+ check((await scalar("select public.claim_notification_run('daily:2026-10-14',2,1)")).claimed===false,'Acknowledged daily digest cannot be sent twice');
+ const ambiguous=await scalar("select public.claim_notification_run('daily:2026-10-15',1,1)");
+ await scalar("select public.finish_notification_run($1,$2,'uncertain','delivery_uncertain')",[ambiguous.id,ambiguous.lease]);
+ check((await scalar("select public.claim_notification_run('daily:2026-10-15',1,1)")).claimed===false,'Ambiguous delivery is never automatically resent');
+ await db.exec('RESET ROLE; SET ROLE authenticated');
+ check(Number(await scalar('select count(*) from public.notification_runs'))===0,'Notification delivery log is hidden from ordinary members');
+ await db.query("update public.crm_actions set status='done' where id=$1",[notifyAction]);
+ await db.query('update public.contacts set ntfy_enabled=false,follow_up_on=null,follow_up_reason=null where id=$1',[notifyContact]);
+ await db.exec('RESET ROLE; SET ROLE service_role');
+ const afterClose=await scalar("select public.ntfy_digest('2026-10-14')");
+ check(afterClose.actions===1&&afterClose.contacts===0,'Completing actions and clearing contact follow-up removes pushes');
+ await db.exec('RESET ROLE; SET ROLE authenticated');
  await db.exec('RESET ROLE');
  const nonmember='11111111-1111-4111-8111-111111111111';
  await db.query(`insert into auth.users(id,email) values($1,'other@example.invalid')`,[nonmember]);
@@ -295,7 +334,7 @@ try {
  check(await scalar('select marketing_opt_out_at is not null from public.contacts where id=$1',[contact]),'Opposition timestamp recorded');
  await db.exec('RESET ROLE');
 
- for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_|001[0-7]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
+ for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_|001[0-8]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
  check(await scalar('select count(*) from public.historical_order_lines')===254,'Migrations safely reapplied after data and reviews');
  check(await scalar('select count(*) from public.app_members where user_id=$1',[nonmember])===0,'Full reapplication preserves membership restrictions');
  if(process.env.LPGRAPP_TEST_RELEASE_SQL){
