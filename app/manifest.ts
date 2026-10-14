@@ -1,0 +1,2 @@
+import type { MetadataRoute } from "next";
+export default function manifest():MetadataRoute.Manifest{return {name:"Collection Livres",short_name:"Livres",description:"Ventes, stocks, inventaires, prêts et dépôts-vente.",start_url:"/",display:"standalone",background_color:"#f5f6f2",theme_color:"#214b3b",icons:[{src:"/icon.svg",sizes:"any",type:"image/svg+xml",purpose:"any maskable"},{src:"/icon-192.png",sizes:"192x192",type:"image/png",purpose:"any maskable"},{src:"/icon-512.png",sizes:"512x512",type:"image/png",purpose:"any maskable"}]}}
