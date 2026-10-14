@@ -2,6 +2,7 @@
 // @electric-sql/pglite module and LPGRAPP_TEST_DATA to the private fixtures folder.
 import {readFile,readdir} from 'node:fs/promises';
 import path from 'node:path';
+import {randomUUID} from 'node:crypto';
 import assert from 'node:assert/strict';
 const {PGlite}=await import(process.env.LPGRAPP_TEST_PGLITE);
 const db=new PGlite();
@@ -32,7 +33,7 @@ try {
   for(const row of fixtures[table])await db.query(`INSERT INTO public.${table} SELECT (jsonb_populate_record(null::public.${table},$1::jsonb)).*`,[JSON.stringify(row)]);
  }
  const auditBaseline=await scalar('select coalesce(max(id),0) from public.audit_logs');
- for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
+ for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_|001[0-6]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
  check(await scalar('select count(*) from public.app_members')===fixtures.profiles.length,'Existing users bootstrapped');
  const imported=await db.query('select public.import_workbook_snapshot($1::jsonb) result',[JSON.stringify(payload)]);
  check(imported.rows[0].result.status==='imported','Snapshot imported');
@@ -58,6 +59,10 @@ try {
  await db.query(`select set_config('request.jwt.claim.sub',$1,false)`,[actor]);
  await db.exec('SET ROLE authenticated');
  check((await db.query('select public.workbook_summary() data')).rows[0].data.orders===59,'Member summary');
+ const initialTotals=(await db.query('select public.dashboard_totals() data')).rows[0].data;
+ check(Number(initialTotals.received_total)===3361.1,'Excel receipts included before any review');
+ check(Number(initialTotals.orders_count)===59,'Imported orders included before review');
+
  await rejects('select public.import_workbook_snapshot($1::jsonb)',[JSON.stringify(payload)],'Browser import forbidden');
  const order=(await db.query(`select o.* from public.historical_orders o where (select count(*) from public.historical_order_lines l where l.order_id=o.id and l.book_id is not null)=1 and (select count(*) from public.historical_order_lines l where l.order_id=o.id)=1 limit 1`)).rows[0];
  const lines=(await db.query('select * from public.historical_order_lines where order_id=$1',[order.id])).rows;
@@ -65,6 +70,15 @@ try {
  await db.query(`select public.review_historical_order($1,'accepted','sale',$2,null,15,15,'Rapproché avec le justificatif de test',$3::jsonb)`,[order.id,order.contact_id,JSON.stringify(reviewLines)]);
  check(await scalar('select review_status from public.historical_orders where id=$1',[order.id])==='accepted','Review applied');
  check(await scalar('select count(*) from public.stock_movements')===0,'Review does not change stock');
+ const reviewedTotals=(await db.query('select public.dashboard_totals() data')).rows[0].data;
+ const historyExpected=3361.1-Number(order.source_received??0)+15;
+ check(Math.abs(Number(reviewedTotals.history_received)-historyExpected)<0.001,'Confirmed historical amount replaces source without double counting');
+ await db.query(`select public.review_historical_order($1,'ignored','sale',$2,null,15,15,'Écarter le doublon pendant le test',$3::jsonb)`,[order.id,order.contact_id,JSON.stringify(reviewLines)]);
+ check(Math.abs(Number((await db.query('select public.dashboard_totals() data')).rows[0].data.history_received)-(historyExpected-15))<0.001,'Explicitly ignored order removed from cumulative total');
+ await db.query(`select public.review_historical_order($1,'accepted','sale',$2,null,15,15,'Rétablir la commande pendant le test',$3::jsonb)`,[order.id,order.contact_id,JSON.stringify(reviewLines)]);
+ check(Number((await db.query('select public.dashboard_totals() data')).rows[0].data.history_orders)===59,'Restored order counted once');
+
+
  await db.exec('RESET ROLE');
  await db.query('select public.import_workbook_snapshot($1::jsonb)',[JSON.stringify(payload)]);
  check(await scalar('select review_status from public.historical_orders where id=$1',[order.id])==='accepted','Replay preserves reviews');
@@ -88,6 +102,10 @@ try {
  const item=JSON.stringify([{book_id:book,quantity:1,unit_price:9}]);
  for(let i=0;i<7;i++)await db.query(`select public.create_sale(current_date,$1,'test','autre',9,0,null,$2::jsonb)`,[contact,item]);
  check(Number((await db.query('select public.dashboard_totals() data')).rows[0].data.sales_total)===63,'Dashboard includes more than six sales');
+ const cumulative=(await db.query('select public.dashboard_totals() data')).rows[0].data;
+ check(Math.abs(Number(cumulative.received_total)-(historyExpected+63))<0.001,'New receipts added to historical receipts');
+ check(Number(cumulative.orders_count)===66,'Historical and new orders counted together');
+
  const request='22222222-2222-4222-8222-222222222222';
  const one={p_sale_date:'2026-10-14',p_contact_id:contact,p_channel:'test',p_payment_method:'autre',p_payment_amount:0,p_shipping_charged:0,p_note:null,p_items:[{book_id:book,quantity:1,unit_price:9}]};
  const created=await scalar('select public.create_sale_once($1,$2::jsonb)',[request,JSON.stringify(one)]);
@@ -106,12 +124,137 @@ try {
  await db.query('select public.resolve_workbook_difference($1,true,$2)',[diff,'Justificatif rapproché pendant le test']);
  check(Number(await scalar("select amount from public.expenses where source_legacy='excel:06 DEPENSES:D012'"))===2822,'Expense changed only by explicit review');
 
+ // V0.5: execute complete recovery and aftercare paths against PostgreSQL.
+ const rpc=async(name,data,id=randomUUID())=>scalar(`select public.${name}($1,$2::jsonb)`,[id,JSON.stringify(data)]);
+ const totals=async()=>(await db.query('select public.dashboard_totals() data')).rows[0].data;
+ const warehouse=async()=>Number(await scalar('select warehouse_stock from public.v_book_stock where book_id=$1',[book]));
+ const financial=async(id)=>(await db.query('select * from public.v_sales_financials where id=$1',[id])).rows[0];
+ const saleLine=await scalar('select id from public.sale_items where sale_id=$1',[created]);
+ const beforeReturn=await warehouse(), beforeCash=Number((await totals()).received_total);
+ const returnedRequest=randomUUID(),returnPayload={sale_id:created,kind:'return',date:'2026-10-14',note:'Retour reçu et contrôlé pour le test',restock:true,shipping_credit:0,items:[{id:saleLine,quantity:1}]};
+ const correction=await rpc('adjust_sale_once',returnPayload,returnedRequest);
+ check(await warehouse()===beforeReturn+1,'Actual customer return restores warehouse');
+ check(Number((await financial(created)).net_due)===0,'Return credits sale amount');
+ check(Number((await financial(created)).refund_due)===9,'Received money remains due back to customer');
+ check(Number((await totals()).received_total)===beforeCash,'Credit alone does not erase cash');
+ check(correction===await rpc('adjust_sale_once',returnPayload,returnedRequest),'Return retry idempotent');
+ check(await warehouse()===beforeReturn+1,'Return retry never restocks twice');
+ await rejects('select public.adjust_sale_once($1,$2::jsonb)',[randomUUID(),JSON.stringify(returnPayload)],'Already returned quantity rejected');
+ await rejects('select public.refund_sale_once($1,$2::jsonb)',[randomUUID(),JSON.stringify({sale_id:created,amount:10,date:'2026-10-14',note:'Test refus trop remboursé'})],'Refund above credit rejected');
+ const refundRequest=randomUUID(),refundPayload={sale_id:created,amount:9,date:'2026-10-14',method:'autre',note:'Remboursement effectué pendant le test'};
+ const refundId=await rpc('refund_sale_once',refundPayload,refundRequest);
+ check(Number((await financial(created)).refund_due)===0,'Refund settles credit');
+ check(Number((await totals()).received_total)===beforeCash-9,'Actual refund reduces cumulative cash');
+ check(refundId===await rpc('refund_sale_once',refundPayload,refundRequest),'Refund retry idempotent');
+ const cancellable=await scalar(`select id from public.sales where id<>$1 limit 1`,[created]);
+ const cashBeforeCancel=Number((await totals()).received_total),qtyBeforeCancel=await warehouse();
+ await rpc('adjust_sale_once',{sale_id:cancellable,kind:'cancellation',date:'2026-10-14',note:'Annulation sans retour physique pour test',restock:false});
+ check(await scalar('select status from public.sales where id=$1',[cancellable])==='cancelled','Cancellation recorded');
+ check(await warehouse()===qtyBeforeCancel,'Cancellation without physical return does not restock');
+ check(Number((await totals()).received_total)===cashBeforeCancel,'Cancellation retains cash until refund');
+ check(Number((await financial(cancellable)).refund_due)===9,'Cancelled sale remains visible as refundable');
+ const searchFinancial=await scalar("select public.search_sales_financials('test',0,500)");
+ check(searchFinancial.total===8,'Sales search includes cancelled sales and all matching rows');
+ const unpaid=await scalar('select public.create_sale_once($1,$2::jsonb)',[randomUUID(),JSON.stringify(one)]);
+ await rpc('adjust_sale_once',{sale_id:unpaid,kind:'price_adjustment',credit:2,date:'2026-10-14',note:'Prix corrigé avant paiement du client'});
+ await rejects('select public.record_sale_payment_once($1,$2::jsonb)',[randomUUID(),JSON.stringify({...payment,p_sale_id:unpaid,p_amount:9})],'Payment capped after price correction');
+ await scalar('select public.record_sale_payment_once($1,$2::jsonb)',[randomUUID(),JSON.stringify({...payment,p_sale_id:unpaid,p_amount:7})]);
+ check(Number((await financial(unpaid)).balance_due)===0,'Corrected amount can be paid exactly');
+
+ const discountedLine=await scalar('select id from public.sale_items where sale_id=$1',[unpaid]);
+ const discountedStock=await warehouse();
+ await rpc('adjust_sale_once',{sale_id:unpaid,kind:'return',date:'2026-10-14',note:'Retour complet après réduction de prix',restock:true,items:[{id:discountedLine,quantity:1}]});
+ check(Number((await financial(unpaid)).net_due)===0,'Return after price reduction caps the credit at actual net amount');
+ check(Number((await financial(unpaid)).refund_due)===7,'Discounted return refunds only money actually paid');
+ check(await warehouse()===discountedStock+1,'Discounted physical return still restores all copies');
+ // Reprise d'un dépôt: neither a new sale nor a withdrawal from warehouse.
+ const baselineWh=await warehouse(),baselineCash=Number((await totals()).received_total);
+ const openPayload={order_id:order.id,kind:'consignment',contact_id:contact,date:'2026-10-14',commission:30,net_due:14,offsite_confirmed:true,note:'Solde confirmé au jour de la bascule',items:[{book_id:book,quantity:2,unit_price:10}]};
+ const openRequest=randomUUID(),opened=await rpc('open_historical_commitment_once',openPayload,openRequest);
+ check(await warehouse()===baselineWh,'Opening offsite consignment never debits warehouse');
+ check(Number(await scalar('select consignment_stock from public.v_book_stock where book_id=$1',[book]))===2,'Already offsite books are visible');
+ check(Number((await totals()).received_total)===baselineCash,'Unpaid opening receivable is not cash');
+ check(Number((await totals()).opening_pending)===14,'Opening receivable displayed separately');
+ check(opened===await rpc('open_historical_commitment_once',openPayload,openRequest),'Opening retry returns same consignment');
+ await rejects('select public.open_historical_commitment_once($1,$2::jsonb)',[randomUUID(),JSON.stringify(openPayload)],'Same historical commitment cannot be opened twice');
+ const receivable=await scalar('select id from public.opening_receivables limit 1');
+ const openingPaymentRequest=randomUUID(),openingPaymentPayload={receivable_id:receivable,amount:10,date:'2026-10-14',method:'autre'};
+ const op=await rpc('record_opening_payment_once',openingPaymentPayload,openingPaymentRequest);
+ check(Number((await totals()).received_total)===baselineCash+10,'Opening payment adds only new cash');
+ check(Number((await totals()).opening_pending)===4,'Opening receivable reduced by actual payment');
+ check(op===await rpc('record_opening_payment_once',openingPaymentPayload,openingPaymentRequest),'Opening payment retry idempotent');
+ await rejects('select public.record_opening_payment_once($1,$2::jsonb)',[randomUUID(),JSON.stringify({...openingPaymentPayload,amount:5})],'Opening overpayment rejected');
+ await db.query('select public.return_consignment_stock($1,$2::jsonb,true,current_date,null)',[opened,JSON.stringify([{book_id:book,quantity:2}])]);
+ check(await warehouse()===baselineWh+2,'Historical consignment return increases warehouse only on actual return');
+ const loanRequest=randomUUID(),loanPayload={...openPayload,kind:'loan',net_due:0,items:[{book_id:book,quantity:1}]};
+ const openedLoan=await rpc('open_historical_commitment_once',loanPayload,loanRequest);
+ check(await warehouse()===baselineWh+2,'Opening historical loan does not debit warehouse');
+ check(Number(await scalar('select loaned_stock from public.v_book_stock where book_id=$1',[book]))===1,'Opening historical loan visible');
+ // The original line must explicitly state how much had already been delivered.
+ const deliveryPayload={order_id:order.id,date:'2026-10-14',note:'Nouvel envoi sur commande déjà payée',items:[{id:lines[0].id,quantity:1}]};
+ await rejects('select public.ship_historical_order_once($1,$2::jsonb)',[randomUUID(),JSON.stringify(deliveryPayload)],'Unknown delivery baseline blocks shipment');
+ const deliveryLines=lines.map(l=>({id:l.id,book_id:book,quantity:2,delivered:1}));
+ await db.query(`select public.review_historical_order($1,'accepted','subscription',$2,null,15,15,'Quantités commandées et livrées confirmées',$3::jsonb)`,[order.id,contact,JSON.stringify(deliveryLines)]);
+ const qtyBeforeShip=await warehouse(),cashBeforeShip=Number((await totals()).received_total),salesBeforeShip=await scalar('select count(*) from public.sales');
+ const shipRequest=randomUUID(),deliveryId=await rpc('ship_historical_order_once',deliveryPayload,shipRequest);
+ check(await warehouse()===qtyBeforeShip-1,'New historical fulfillment debits warehouse once');
+ check(Number(await scalar('select delivered_quantity from public.historical_order_lines where id=$1',[lines[0].id]))===2,'Fulfillment updates delivered total');
+ check(Number((await totals()).received_total)===cashBeforeShip,'Historical delivery never creates new cash');
+ check(await scalar('select count(*) from public.sales')===salesBeforeShip,'Historical delivery never creates duplicate sale');
+ check(deliveryId===await rpc('ship_historical_order_once',deliveryPayload,shipRequest),'Historical shipment retry idempotent');
+ check(await warehouse()===qtyBeforeShip-1,'Historical shipment retry never debits twice');
+ await rejects('select public.ship_historical_order_once($1,$2::jsonb)',[randomUUID(),JSON.stringify(deliveryPayload)],'Overdelivery rejected');
+ await rejects(`select public.review_historical_order($1,'accepted','subscription',$2,null,15,15,'Tentative de diminuer les livraisons',$3::jsonb)`,[order.id,contact,JSON.stringify(deliveryLines)],'Journaled delivery cannot be reduced by review');
+ const histRefundRequest=randomUUID(),histRefundPayload={order_id:order.id,date:'2026-10-14',amount:5,method:'autre',note:'Remboursement historique effectué pour test',stop_delivery:true};
+ const hr=await rpc('refund_historical_once',histRefundPayload,histRefundRequest);
+ check(Number((await totals()).received_total)===cashBeforeShip-5,'Historical refund reduces cumulative amount once');
+ check(hr===await rpc('refund_historical_once',histRefundPayload,histRefundRequest),'Historical refund retry idempotent');
+ check(await scalar('select fulfillment_closed from public.historical_orders where id=$1',[order.id])===true,'Historical refund can stop future delivery');
+ await rejects(`select public.review_historical_order($1,'ignored','subscription',$2,null,15,15,'Ignorer commande déjà remboursée',$3::jsonb)`,[order.id,contact,JSON.stringify(deliveryLines.map(l=>({...l,delivered:2})))],'Refunded historical order cannot be excluded twice');
+
+ // A later payment on a historical order is separate from its opening receipt.
+ const outstandingOrder=(await db.query("select * from public.historical_orders where id<>$1 and review_status='to_review' and source_received is not null limit 1",[order.id])).rows[0];
+ const outstandingLines=(await db.query('select * from public.historical_order_lines where order_id=$1',[outstandingOrder.id])).rows;
+ const retainedLines=outstandingLines.map(l=>({id:l.id,book_id:l.book_id,quantity:l.source_quantity,delivered:null}));
+ await db.query(`select public.review_historical_order($1,'accepted','sale',$2,null,30,10,'Solde client confirmé sur justificatif',$3::jsonb)`,[outstandingOrder.id,outstandingOrder.contact_id,JSON.stringify(retainedLines)]);
+ const cashBeforeHistPayment=Number((await totals()).received_total),histPaymentId=randomUUID();
+ const histPaymentPayload={order_id:outstandingOrder.id,date:'2026-10-14',amount:20,method:'autre',note:'Solde réellement reçu après bascule'};
+ const histPayment=await rpc('pay_historical_once',histPaymentPayload,histPaymentId);
+ check(Number((await totals()).received_total)===cashBeforeHistPayment+20,'New historical payment adds only its actual amount');
+ check(histPayment===await rpc('pay_historical_once',histPaymentPayload,histPaymentId),'Historical payment retry idempotent');
+ await rejects('select public.pay_historical_once($1,$2::jsonb)',[randomUUID(),JSON.stringify({...histPaymentPayload,amount:1})],'Historical overpayment rejected');
+ await rejects(`select public.review_historical_order($1,'accepted','sale',$2,null,30,30,'Tentative de recopier nouveau paiement',$3::jsonb)`,[outstandingOrder.id,outstandingOrder.contact_id,JSON.stringify(retainedLines)],'New historical payment cannot also be copied into baseline receipt');
+ await rpc('refund_historical_once',{order_id:outstandingOrder.id,date:'2026-10-14',amount:30,method:'autre',note:'Remboursement des montants anciens et nouveaux'});
+ check(Number((await totals()).received_total)===cashBeforeHistPayment-10,'Historical refund may include later actual payments without duplicate deduction');
+ // Admin settings seed once; reapplying preserves user edits.
+ await db.exec('RESET ROLE');
+ await db.query('update public.app_members set can_admin=true where user_id=$1',[actor]);
+ await db.exec(await readFile('supabase/migrations/202610140012_settings_and_summary.sql','utf8'));
+ await db.exec('SET ROLE authenticated');
+ check(Number(await scalar('select count(*) from public.shipping_rates'))>0,'Postal rates initialized from stored resources');
+ await db.query("select public.save_shipping_rate('France',1,8.75,true)");
+ await db.query('select public.save_collection_settings(500,800,200,6)');
+ const projection=await scalar('select public.collection_projection()');
+ check(projection.length===33,'Projection covers all 33 books');
+ const futureBook=await scalar("select id from public.books where illustrator_cost is null and printer_cost is null limit 1");
+ check(Number(projection.find(p=>p.book_id===futureBook).total)===1300,'Missing costs use updated Supabase settings');
+ await db.exec('RESET ROLE');
+ await db.exec(await readFile('supabase/migrations/202610140012_settings_and_summary.sql','utf8'));
+ check(Number(await scalar("select amount from public.shipping_rates where zone='France' and quantity=1"))===8.75,'Rate reinitialization never overwrites edited prices');
+ await db.query('update public.app_members set can_admin=false where user_id=$1',[actor]);
+ await db.exec('SET ROLE authenticated');
+ await rejects('select public.save_collection_settings(1,1,1,1)',[],'Ordinary user cannot change settings');
+ await rejects("select public.save_shipping_rate('France',1,1,true)",[],'Ordinary user cannot change postal rates');
+ await rejects(`insert into public.sale_refunds(sale_id,refund_date,amount,payment_method,note,created_by) values($1,current_date,1,'autre','bypass',$2)`,[created,actor],'Direct refund writes denied');
  await db.exec('RESET ROLE');
  const nonmember='11111111-1111-4111-8111-111111111111';
  await db.query(`insert into auth.users(id,email) values($1,'other@example.invalid')`,[nonmember]);
  await db.query(`select set_config('request.jwt.claim.sub',$1,false)`,[nonmember]);
  await db.exec('SET ROLE authenticated');
  check(await scalar('select count(*) from public.contacts')===0,'Nonmember cannot read contacts');
+ check(await scalar('select count(*) from public.sale_refunds')===0,'Nonmember cannot read refunds');
+ await rejects('select public.search_sales_financials()',[],'Nonmember cannot search sales');
+ await rejects('select public.open_historical_commitment_once($1,$2::jsonb)',[randomUUID(),JSON.stringify(openPayload)],'Nonmember cannot open a historical commitment');
  await rejects(`select public.create_sale(current_date,null,'test','autre',9,0,null,$1::jsonb)`,[item],'Nonmember RPC blocked');
  await db.exec('RESET ROLE');
  await db.exec(await readFile('supabase/migrations/202610140006_members_and_fixes.sql','utf8'));
@@ -129,8 +272,17 @@ try {
  check(await scalar('select marketing_opt_out_at is not null from public.contacts where id=$1',[contact]),'Opposition timestamp recorded');
  await db.exec('RESET ROLE');
 
- for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
+ for(const name of (await readdir('supabase/migrations')).filter(x=>/00[6789]_|001[0-6]_/.test(x)).sort())await db.exec(await readFile('supabase/migrations/'+name,'utf8'));
  check(await scalar('select count(*) from public.historical_order_lines')===254,'Migrations safely reapplied after data and reviews');
  check(await scalar('select count(*) from public.app_members where user_id=$1',[nonmember])===0,'Full reapplication preserves membership restrictions');
+ if(process.env.LPGRAPP_TEST_RELEASE_SQL){
+  const before=(await db.query('select count(*)::integer n from public.stock_movements')).rows[0].n;
+  const install=await readFile(process.env.LPGRAPP_TEST_RELEASE_SQL,'utf8');
+  await db.exec(install);await db.exec(install);
+  check(await scalar('select count(*)::integer from public.stock_movements')===before,'Combined SQL installer can be replayed without stock changes');
+  await db.exec('SET ROLE authenticated');
+  check(Number((await totals()).received_total)>0,'Combined SQL installer preserves access to cumulative totals');
+  await db.exec('RESET ROLE');
+ }
  console.log(`${checks} PostgreSQL integration checks passed. No remote database used.`);
 } catch(e) {console.error(JSON.stringify({message:e.message,detail:e.detail,where:e.where,code:e.code}));process.exitCode=1;} finally {await db.close();}
