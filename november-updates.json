@@ -1,0 +1,111 @@
+{
+  "books": {
+    "10": {
+      "price": 16.5,
+      "release_month": "2026-12",
+      "status": "prochain"
+    },
+    "12": {
+      "price": 15,
+      "release_month": "2027-04",
+      "status": "prochain"
+    },
+    "13": {
+      "price": 15,
+      "release_month": "2027-04",
+      "status": "prochain"
+    },
+    "14": {
+      "price": 15,
+      "release_month": "2027-04",
+      "status": "prochain"
+    },
+    "15": {
+      "price": 15,
+      "release_month": "2027-04",
+      "status": "prochain"
+    },
+    "16": {
+      "price": 15,
+      "release_month": "2027-10",
+      "status": "prochain"
+    },
+    "17": {
+      "price": 15,
+      "release_month": "2027-10",
+      "status": "prochain"
+    },
+    "18": {
+      "price": 15,
+      "release_month": "2027-10",
+      "status": "prochain"
+    },
+    "19": {
+      "price": 15,
+      "release_month": "2027-10",
+      "status": "prochain"
+    },
+    "20": {
+      "price": 16.5,
+      "release_month": "2027-12",
+      "status": "prochain"
+    },
+    "30": {
+      "price": 16.5
+    }
+  },
+  "events": [
+    {
+      "slug": "plesidy-decembre-2026",
+      "title": "Rencontre à Plésidy",
+      "start_date": "2026-12-20",
+      "city": "Plésidy",
+      "place": "",
+      "confirmed": false,
+      "description": "Date communiquée par les auteurs, lieu et organisation à confirmer."
+    },
+    {
+      "slug": "parentis-2027",
+      "title": "Rencontre à Parentis-en-Born",
+      "start_date": "2027-06-12",
+      "city": "Parentis-en-Born",
+      "place": "",
+      "confirmed": false,
+      "description": "Date communiquée par les auteurs, lieu et organisation à confirmer."
+    },
+    {
+      "slug": "roche-calais-2027",
+      "title": "Rencontre à La Roche-Calais",
+      "start_date": "2027-06-13",
+      "city": "La Roche-Calais",
+      "place": "",
+      "confirmed": false,
+      "description": "Date communiquée par les auteurs, lieu et organisation à confirmer."
+    }
+  ],
+  "stores": [
+    {
+      "slug": "monocle",
+      "name": "La Librairie Monocle",
+      "address": "16 place de la Liberté",
+      "postal_code": "22260",
+      "city": "Pontrieux",
+      "phone": "02 96 92 95 62",
+      "url": "https://librairesenbretagne.com/presentation/librairie_monocle/"
+    },
+    {
+      "slug": "gwalarn",
+      "name": "Librairie Gwalarn",
+      "address": "15 Rue des Chapeliers",
+      "postal_code": "22300",
+      "city": "Lannion",
+      "phone": "02 96 37 40 53",
+      "url": "https://gwalarn.fr/"
+    }
+  ],
+  "subscription": {
+    "min_books": 3,
+    "max_books": 12,
+    "max_parcel": 3
+  }
+}

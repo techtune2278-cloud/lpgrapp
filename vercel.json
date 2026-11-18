@@ -1,4 +1,74 @@
 {
-  "framework": "nextjs",
-  "crons": [{"path": "/api/cron/ntfy", "schedule": "0 7 * * *"}]
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "cleanUrls": true,
+  "trailingSlash": true,
+  "redirects": [
+    {
+      "source": "/nouvellecollection2025",
+      "destination": "/bonus/moliere/",
+      "permanent": true
+    },
+    {
+      "source": "/autrices",
+      "destination": "/auteurs/",
+      "permanent": true
+    },
+    {
+      "source": "/agenda",
+      "destination": "/ou-nous-trouver/",
+      "permanent": true
+    },
+    {
+      "source": "/faq",
+      "destination": "/livraison/",
+      "permanent": true
+    }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "Referrer-Policy",
+          "value": "strict-origin-when-cross-origin"
+        },
+        {
+          "key": "Permissions-Policy",
+          "value": "camera=(), microphone=(), geolocation=()"
+        }
+      ]
+    },
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
+        }
+      ]
+    },
+    {
+      "source": "/assets/(optimized|sharing|fonts)/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=31536000, immutable"
+        }
+      ]
+    }
+  ],
+  "functions": {
+    "api/subscription.js": {
+      "maxDuration": 60
+    },
+    "api/admin.js": {
+      "maxDuration": 60
+    }
+  }
 }

@@ -1,27 +1,17 @@
 {
-  "name": "collection-livres-manager",
-  "version": "0.1.0",
+  "name": "les-plus-grands-racontes",
+  "version": "1.8.9",
   "private": true,
+  "description": "Site vitrine de la collection jeunesse",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "eslint .",
-    "import:legacy": "node scripts/import-legacy-staging.mjs"
+    "build": "node scripts/build.mjs",
+    "preview": "python -m http.server 8080 --bind 127.0.0.1 --directory dist",
+    "test": "node --test tests/*.test.js"
+  },
+  "engines": {
+    "node": "22.x"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.112.4",
-    "lucide-react": "^0.468.0",
-    "next": "^16.0.0",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0"
-  },
-  "devDependencies": {
-    "@types/node": "^22.15.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "eslint": "^9.0.0",
-    "eslint-config-next": "^16.0.0",
-    "typescript": "^5.8.0"
+    "nodemailer": "10.4.0"
   }
 }

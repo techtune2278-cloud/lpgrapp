@@ -1,0 +1,45 @@
+{
+  "shop_url": "https://sur-le-chemin-des-arts.sumupstore.com/",
+  "offer_urls": {
+    "duo": "",
+    "trio": "",
+    "quatre-premiers": "",
+    "collection-parue": "",
+    "abonnement-6-envois": "",
+    "abonnement-2-envois": ""
+  },
+  "moliere_audio_url": "",
+  "shipping": [
+    {
+      "quantity": "1 livre",
+      "france": "4,50 €",
+      "europe": "9,00 €",
+      "us": "40,00 €"
+    },
+    {
+      "quantity": "2 à 3 livres",
+      "france": "7,00 €",
+      "europe": "15,50 €",
+      "us": "40,00 €"
+    },
+    {
+      "quantity": "4 à 6 livres",
+      "france": "9,00 €",
+      "europe": "21,00 €",
+      "us": "40,00 €"
+    },
+    {
+      "quantity": "7 à 12 livres",
+      "france": "11,00 €",
+      "europe": "21,00 €",
+      "us": "40,00 €"
+    }
+  ],
+  "bonus_page_url": "https://www.lescompagnonsderoute.com/les-bonus-de-la-collection-lpgrapp",
+  "publication_mode": "production",
+  "site_url": "https://sitelpgrapp.vercel.app",
+  "google_site_verification": "",
+  "bing_site_verification": "",
+  "analytics_enabled": false,
+  "contact_email": "contact@lesplusgrandsracontes.fr"
+}
